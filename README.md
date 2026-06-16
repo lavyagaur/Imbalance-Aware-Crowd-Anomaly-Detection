@@ -992,6 +992,176 @@ For each video frame x_t at time t:
 | 0.08 ≤ s_t < 0.15 | Suspicious | Sudden movement, running |
 | s_t ≥ 0.15 | Anomaly | Panic, stampede, fight |
 
+### 8.2.2 Failure Cases
+![1](https://github.com/lavyagaur/Imbalance-Aware-Crowd-Anomaly-Detection/blob/main/Images/failurecase_1.jpeg)
+Despite the aggressive metastability control, the system is susceptible to specific failure modes arising from both its architectural limitations and the nature of reconstruction-based anomaly detection.
+
+#### Failure Mode A: Missed Anomaly (False Negative)
+
+**Scenario:** An anomaly is present but the system fails to detect it.
+
+**Root Causes in This Implementation:**
+
+| Cause | Explanation | Why It Happens Here |
+|-------|-------------|---------------------|
+| **Occlusion** | Anomalous region is masked by dense normal patterns | Generator reconstructs the dominant normal region well; MSE stays low |
+| **Localized anomaly** | Small anomaly in large frame | MSE averages over all pixels; small region gets diluted: `MSE = (1/12288)·Σ(x-x̂)²` |
+| **Data leakage** | Test anomaly was in training set | Generator learned to reconstruct it; MSE artificially low |
+| **Threshold too high** | τ* set conservatively | Anomaly scores below threshold classified as normal |
+
+**Example:**
+```
+Frame: 64×64 crowd scene
+Anomaly: Single person running (occupies ~5% of frame)
+Rest: 95% normal standing crowd
+
+MSE calculation:
+  Anomaly region (5%):  error = 0.30  (high)
+  Normal region (95%):  error = 0.02  (low)
+  Overall MSE = 0.05×0.30 + 0.95×0.02 = 0.034
+  
+If τ* = 0.07: 0.034 < 0.07 → Classified as NORMAL (MISSED)
+```
+
+**Why the current code is vulnerable:**
+```python
+# The MSE is a global average:
+recon_error = torch.mean((img - gen_img) ** 2)
+# A small anomaly in a large frame gets averaged out
+# No spatial weighting or attention mechanism exists
+```
+
+---
+
+#### Failure Mode B: False Positive (False Alarm)
+
+**Scenario:** Normal behavior is incorrectly flagged as anomalous.
+
+**Root Causes in This Implementation:**
+
+| Cause | Explanation | Why It Happens Here |
+|-------|-------------|---------------------|
+| **Lighting changes** | Sudden illumination shift | Pixel values change globally; reconstruction error spikes |
+| **Shadow movement** | Moving shadows create "motion-like" patterns | Generator interprets shadow edges as anomaly streaks |
+| **Camera shake** | Global frame shift | All pixels displaced; MSE increases across entire frame |
+| **Weather effects** | Rain, fog, reflections | Visual appearance deviates from training distribution |
+| **Threshold too low** | τ* set aggressively | Normal variations exceed threshold |
+
+**Example:**
+```
+Frame: Normal crowd, sudden cloud shadow passes
+Effect: Global brightness drop of 30%
+
+Generator was trained on bright scenes only
+Reconstruction: Generator outputs bright scene
+MSE: (dark_frame - bright_reconstruction)² = HIGH
+
+Score: 0.12 > τ* = 0.07 → ANOMALY (FALSE ALARM)
+```
+
+**Why the current code is vulnerable:**
+```python
+# The generator conditions on label only, not on lighting/environment:
+gen_img = self.generator(z, label)
+# No mechanism to adapt to environmental variations
+# No preprocessing to normalize illumination
+```
+
+---
+
+#### Failure Mode C: Boundary Case (Classification Uncertainty)
+
+**Scenario:** Normal and anomalous scores overlap, creating ambiguous classifications.
+
+**Root Causes in This Implementation:**
+
+| Cause | Explanation | Why It Happens Here |
+|-------|-------------|---------------------|
+| **Score overlap** | Normal and anomaly distributions intersect | Threshold inevitably misclassifies some samples |
+| **Transitional behavior** | Crowd shifting from normal to anomalous | Scores fall in the "gray zone" |
+| **Similar visual patterns** | Some normal patterns resemble anomalies | Structured chaos vs chaotic structure |
+| **Generator capacity** | Limited 64×64 resolution | Fine distinctions lost in low resolution |
+
+**Example Score Distribution:**
+```
+Normal scores:    [0.018, 0.022, 0.025, 0.031, 0.038, 0.045, 0.052, 0.058, ...]
+Anomaly scores:   [0.042, 0.048, 0.055, 0.062, 0.071, 0.089, 0.112, 0.145, ...]
+                            ↑________________↑
+                              Overlap zone
+                           (0.042 - 0.058)
+
+Samples in overlap: Classified based on τ*, inherently error-prone
+```
+
+**Why the current code is vulnerable:**
+```python
+# Single threshold for all decisions:
+predictions = (scores > threshold).astype(int)
+# No confidence scoring
+# No "uncertain" classification option
+# No ensemble or multi-threshold approach
+```
+
+---
+
+#### Failure Mode D: Mode Collapse During Training
+
+**Scenario:** Generator produces limited variety, making all inputs appear anomalous or all appear normal.
+
+**Detection in Current Code:**
+```python
+def _check_wasserstein_health(self, wasserstein_d):
+    if abs(wd) < 0.01:
+        return False, "Mode collapse likely"
+```
+
+**Effect on Anomaly Detection:**
+```
+If generator collapses to producing one type of normal scene:
+  → All normal inputs reconstruct well (low MSE)
+  → All anomaly inputs also reconstruct poorly (high MSE)
+  → Separation is good BUT...
+  → Generator cannot represent the full range of normal behavior
+  → New normal variations will be flagged as anomalies
+```
+
+---
+
+#### Failure Mode E: Data Leakage Amplification
+
+**Specific to this implementation** (see Section 4.7):
+
+```
+Training set: Contains all 25 anomaly patterns
+Test set: Contains copies of those same 25 patterns
+
+Effect on failure cases:
+  • Missed anomalies: MORE likely (generator saw exact patterns)
+  • False positives: Unchanged (normal patterns not leaked)
+  • Boundary cases: MORE overlap (scores compressed due to memorization)
+  
+Score compression due to leakage:
+  Without leakage: Anomaly scores 0.10 - 0.25 (genuine reconstruction difficulty)
+  With leakage:    Anomaly scores 0.06 - 0.15 (generator has seen these before)
+                   ↑ Closer to normal scores → More boundary cases
+```
+
+---
+
+#### Summary of Failure Modes
+
+```
+┌─────────────────┬────────────────────┬──────────────────────────────┐
+│ Failure Mode    │ Primary Cause      │ Specific to This Code?       │
+├─────────────────┼────────────────────┼──────────────────────────────┤
+│ Missed Anomaly  │ Global MSE pooling │ Yes (no spatial attention)   │
+│ False Positive  │ Environment change │ Yes (no illumination norm)   │
+│ Boundary Case   │ Score distribution │ Partially (worse with leak)  │
+│ Mode Collapse   │ GAN training       │ No (common to all GANs)      │
+│ Leakage Effect  │ Test in training   │ YES (bootstrap before split) │
+└─────────────────┴────────────────────┴──────────────────────────────┘
+```
+
 
 ### 8.4 Gap Analysis: What's Missing for Real Deployment
 
