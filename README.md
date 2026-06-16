@@ -1223,4 +1223,200 @@ Despite being synthetic and static, the approach detects pattern changes relevan
 | **Wrong direction** | Motion vector anomaly | ❌ Needs optical flow |
 | **Tailgating** | Sequential spatial pattern | ❌ Needs object tracking |
 
+## Section 9: Comparison of CGAN Against Perceiver IO and CAE
+
+### 9.1 Overview
+
+This section compares three architectural approaches to crowd anomaly detection: **Conditional GAN (this code)**, **Perceiver IO**, and **Convolutional Autoencoder (CAE)**. The UMN Crowd Dataset serves as a common benchmark across all three methods.
+
+### 9.2 Architectural Comparison
+
+```
+┌─────────────────┬─────────────────────┬──────────────────────┬─────────────────────┐
+│ Aspect          │ CGAN (This Code)    │ Perceiver IO         │ CAE                 │
+├─────────────────┼─────────────────────┼──────────────────────┼─────────────────────┤
+│ Input           │ Single 64×64 frame  │ 16-frame clips       │ Single frame        │
+│                 │ + label condition   │ (T×224×224×3)        │ (variable size)     │
+├─────────────────┼─────────────────────┼──────────────────────┼─────────────────────┤
+│ Temporal        │ NONE                │ YES (self-attention  │ NONE                │
+│ Processing      │ (static images)     │  over 16 frames)     │ (static images)     │
+├─────────────────┼─────────────────────┼──────────────────────┼─────────────────────┤
+│ Spatial         │ CNN (Conv2d layers) │ Cross-attention      │ CNN (Conv2d layers) │
+│ Processing      │ Local receptive     │ Global relationships │ Local receptive     │
+│                 │ fields              │ across all positions │ fields              │
+├─────────────────┼─────────────────────┼──────────────────────┼─────────────────────┤
+│ Complexity      │ O(N) linear         │ O(N) linear          │ O(N) linear         │
+│                 │ (small 64×64 input) │ (via latent bottleneck)│ (encoder-decoder) │
+├─────────────────┼─────────────────────┼──────────────────────┼─────────────────────┤
+│ Attention       │ NONE                │ Cross + Self         │ NONE                │
+│ Mechanism       │                     │ attention            │                     │
+├─────────────────┼─────────────────────┼──────────────────────┼─────────────────────┤
+│ Bottleneck      │ No explicit         │ 512-dim latent array │ Encoder latent space│
+│                 │ bottleneck          │ (fixed size)         │ (variable size)     │
+├─────────────────┼─────────────────────┼──────────────────────┼─────────────────────┤
+│ Conditioning    │ Binary label (0/1)  │ None (unsupervised   │ None (unsupervised  │
+│                 │                     │  pretraining)        │  pretraining)       │
+├─────────────────┼─────────────────────┼──────────────────────┼─────────────────────┤
+│ Anomaly Score   │ Reconstruction MSE  │ Binary classifier    │ Reconstruction MSE  │
+│                 │ (pixel-level)       │ output (softmax)     │ (pixel-level)       │
+├─────────────────┼─────────────────────┼──────────────────────┼─────────────────────┤
+│ Training Data   │ Synthetic (500)     │ UMN Dataset frames   │ UMN Dataset frames  │
+│                 │                     │ (1000 frames)        │                     │
+└─────────────────┴─────────────────────┴──────────────────────┴─────────────────────┘
+```
+
+### 9.3 Spatial Modeling: CAE Complements CGAN
+
+#### What CAE Does Better
+
+**Convolutional Autoencoders** learn compact spatial representations through encoder-decoder reconstruction:
+
+```
+CAE Architecture:
+  Input (H×W×C) → Encoder (Conv+Pool) → Latent Vector (z) → Decoder (Conv+Upsample) → Reconstruction
+```
+
+| CAE Strength | Why CGAN Needs It |
+|-------------|-------------------|
+| **Deterministic encoding** | CGAN uses random z sampling; CAE provides a deterministic mapping from image→latent→image |
+| **Stable latent space** | CAE latent vectors are structured; CGAN latent space is random noise |
+| **No adversarial training** | CAE avoids D/G instability; useful as pretraining or complementary score |
+| **Explicit bottleneck** | CAE forces compression; CGAN generator can ignore latent if D is weak |
+
+#### How CAE Would Complement This CGAN
+
+```python
+# Current CGAN scoring (only):
+s_cgan(x) = MSE(x, G(z, y))          # Random z, 3 attempts
+
+# Enhanced with CAE:
+s_cae(x) = MSE(x, CAE.decode(CAE.encode(x)))  # Deterministic
+
+# Combined score:
+s_combined(x) = λ₁ · s_cgan(x) + λ₂ · s_cae(x)
+# CGAN: Learns "what should this class look like?"
+# CAE:  Learns "what is the essential structure of this image?"
+```
+
+**Complementary benefits:**
+- CGAN excels at **generative diversity** (knows what normal/anomaly should look like)
+- CAE excels at **compact representation** (knows what information matters)
+- Combined: CGAN catches class-specific deviations, CAE catches structural anomalies
+
+### 9.4 Temporal Modeling: Perceiver IO Complements CGAN
+
+#### What Perceiver IO Does Better
+
+Perceiver IO processes **sequences of frames** using attention mechanisms:
+
+```
+Perceiver IO Architecture:
+  Input (T×H×W×C) → Cross-Attention Encoder → Latent Array (512-dim)
+                                          ↓
+                                  Self-Attention Processor (iterative)
+                                          ↓
+                                  Decoder → Binary Classification
+```
+
+| Perceiver IO Strength | Why CGAN Needs It |
+|----------------------|-------------------|
+| **Temporal context** | CGAN processes single frames; Perceiver IO sees 16-frame motion patterns |
+| **Global attention** | CGAN uses local convolutions; Perceiver IO relates any position to any other |
+| **Linear complexity** | O(N) via latent bottleneck; enables high-resolution processing |
+| **Motion understanding** | Self-attention over time captures velocity, acceleration, trajectory |
+
+#### How Perceiver IO Would Complement This CGAN
+
+```python
+# Current CGAN: single frame
+s_cgan(x_t) = MSE(x_t, G(z, y))     # No temporal awareness
+
+# Perceiver IO: 16-frame clip
+s_perceiver(x_{t-15:t}) = PerceiverIO.classify(x_{t-15}, ..., x_t)  # Motion-aware
+
+# Complementary signals:
+# CGAN:     "Does this frame look anomalous in texture?"
+# Perceiver: "Is this motion pattern anomalous?"
+```
+
+**Complementary benefits:**
+- CGAN detects **spatial/texture anomalies** (unusual patterns, chaos, streaks)
+- Perceiver IO detects **temporal/motion anomalies** (sudden acceleration, direction change)
+- Combined: Spatial anomaly + normal motion = false alarm reduction; Normal appearance + anomalous motion = catch what CGAN misses
+
+### 9.5 How Perceiver IO and CAE Complement Each Other
+
+Even without CGAN, these two complement each other:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    IDEAL HYBRID SYSTEM                      │
+│                                                             │
+│  Video Stream (T frames)                                    │
+│       │                                                     │
+│       ├──→ CAE (per frame) ──→ Spatial anomaly score s_s    │
+│       │    "Does this frame look weird?"                    │
+│       │                                                     │
+│       └──→ Perceiver IO (16 frames) ──→ Temporal score s_t  │
+│            "Is this motion pattern unusual?"                │
+│                                                             │
+│  Combined: s_total = α·s_s + β·s_t                          │
+│                                                             │
+│  Alert if s_total > τ                                       │
+└─────────────────────────────────────────────────────────────┘
+```
+
+| Scenario | CAE Score | Perceiver IO Score | Combined | Result |
+|----------|-----------|-------------------|----------|--------|
+| Normal crowd walking | Low | Low | Low | ✅ No alert |
+| Person running (clear anomaly) | High | High | High | ✅ Alert |
+| Lighting change (false positive for CAE) | High | Low | Medium | ✅ No false alert |
+| Slow suspicious behavior | Low | High | Medium | ✅ Catches what CAE misses |
+| Dense crowd (normal but looks chaotic) | High | Low | Medium | ✅ Reduced false positive |
+
+### 9.6 Three-Way Comparison Summary
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                     METHOD COMPARISON TABLE                          │
+├────────────┬───────────────┬───────────────┬─────────────────────────┤
+│ Capability │ CGAN          │ CAE           │ Perceiver IO            │
+│            │ (This Code)   │               │                         │
+├────────────┼───────────────┼───────────────┼─────────────────────────┤
+│ Spatial    │ ✅ Generative │ ✅ Deterministic│ ✅ Global attention    │
+│ Modeling   │ (knows "look")│ (knows structure)│ (relates all positions)│
+├────────────┼───────────────┼───────────────┼─────────────────────────┤
+│ Temporal   │ ❌ None       │ ❌ None       │ ✅ 16-frame attention   │
+│ Modeling   │               │               │ (motion patterns)       │
+├────────────┼───────────────┼───────────────┼─────────────────────────┤
+│ Attention  │ ❌ None       │ ❌ None       │ ✅ Cross + Self         │
+│ Mechanism  │               │               │                         │
+├────────────┼───────────────┼───────────────┼─────────────────────────┤
+│ Complexity │ O(N)          │ O(N)          │ O(N) via latent array   │
+├────────────┼───────────────┼───────────────┼─────────────────────────┤
+│ Training   │ Adversarial   │ Reconstruction│ Supervised              │
+│ Objective  │ (WGAN-GP)     │ (MSE)         │ (Binary Cross-Entropy)  │
+├────────────┼───────────────┼───────────────┼─────────────────────────┤
+│ Bottleneck │ None explicit │ Encoder latent │ 512-dim latent array    │
+├────────────┼───────────────┼───────────────┼─────────────────────────┤
+│ Real-time  │ ⚠️ CPU-opt    │ ✅ Fast       │ ✅ Linear scaling       │
+│ Ready      │ (not tested)  │ inference     │ (predictable latency)   │
+├────────────┼───────────────┼───────────────┼─────────────────────────┤
+│ Data       │ Synthetic     │ UMN Dataset   │ UMN Dataset             │
+│            │ (500 images)  │               │ (1000 frames)           │
+├────────────┼───────────────┼───────────────┼─────────────────────────┤
+│ Anomaly    │ Reconstruction│ Reconstruction│ Binary Classification    │
+│ Detection  │ MSE           │ MSE           │ (Softmax output)        │
+├────────────┼───────────────┼───────────────┼─────────────────────────┤
+│ Strengths  │ Class-        │ Stable        │ Temporal awareness      │
+│            │ conditional   │ training      │ Global context          │
+│            │ generation    │ Compact rep   │ Multi-modal ready       │
+├────────────┼───────────────┼───────────────┼─────────────────────────┤
+│ Weaknesses │ No temporal   │ No temporal   │ Requires sequence data  │
+│            │ No attention  │ No attention  │ Higher data requirements│
+│            │ Adversarial   │ No generative │ Supervised labels       │
+│            │ instability   │ capability    │ needed                  │
+└────────────┴───────────────┴───────────────┴─────────────────────────┘
+```
+
 
