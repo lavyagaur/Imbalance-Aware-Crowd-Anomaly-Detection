@@ -992,8 +992,8 @@ For each video frame x_t at time t:
 | 0.08 ≤ s_t < 0.15 | Suspicious | Sudden movement, running |
 | s_t ≥ 0.15 | Anomaly | Panic, stampede, fight |
 
-### 8.2.2 Failure Cases
-![1](https://github.com/lavyagaur/Imbalance-Aware-Crowd-Anomaly-Detection/blob/main/Images/failurecase_1.jpeg)
+## Section 8.2.2: Failure Cases
+
 Despite the aggressive metastability control, the system is susceptible to specific failure modes arising from both its architectural limitations and the nature of reconstruction-based anomaly detection.
 
 #### Failure Mode A: Missed Anomaly (False Negative)
@@ -1005,30 +1005,18 @@ Despite the aggressive metastability control, the system is susceptible to speci
 | Cause | Explanation | Why It Happens Here |
 |-------|-------------|---------------------|
 | **Occlusion** | Anomalous region is masked by dense normal patterns | Generator reconstructs the dominant normal region well; MSE stays low |
-| **Localized anomaly** | Small anomaly in large frame | MSE averages over all pixels; small region gets diluted: `MSE = (1/12288)·Σ(x-x̂)²` |
-| **Data leakage** | Test anomaly was in training set | Generator learned to reconstruct it; MSE artificially low |
+| **Localized anomaly** | Small anomaly in large frame | MSE averages over all pixels; small region gets diluted |
+| **Data leakage** | Test anomaly was in training set | Generator learned to reconstruct it; MSE artificially low (see Section 4.7) |
 | **Threshold too high** | τ* set conservatively | Anomaly scores below threshold classified as normal |
 
-**Example:**
-```
-Frame: 64×64 crowd scene
-Anomaly: Single person running (occupies ~5% of frame)
-Rest: 95% normal standing crowd
-
-MSE calculation:
-  Anomaly region (5%):  error = 0.30  (high)
-  Normal region (95%):  error = 0.02  (low)
-  Overall MSE = 0.05×0.30 + 0.95×0.02 = 0.034
-  
-If τ* = 0.07: 0.034 < 0.07 → Classified as NORMAL (MISSED)
-```
-
 **Why the current code is vulnerable:**
+
 ```python
-# The MSE is a global average:
+# The MSE is a global average over all pixels:
 recon_error = torch.mean((img - gen_img) ** 2)
-# A small anomaly in a large frame gets averaged out
-# No spatial weighting or attention mechanism exists
+# Total pixels: 3 × 64 × 64 = 12,288
+# A small anomaly occupying 5% of pixels contributes only 5% to the final score
+# No spatial weighting or attention mechanism exists to focus on anomalous regions
 ```
 
 ---
@@ -1041,30 +1029,38 @@ recon_error = torch.mean((img - gen_img) ** 2)
 
 | Cause | Explanation | Why It Happens Here |
 |-------|-------------|---------------------|
-| **Lighting changes** | Sudden illumination shift | Pixel values change globally; reconstruction error spikes |
-| **Shadow movement** | Moving shadows create "motion-like" patterns | Generator interprets shadow edges as anomaly streaks |
+| **Input outside training distribution** | Pixel values differ from synthetic training data | Generator trained on specific color ranges; unfamiliar values cause high MSE |
+| **Shadow movement** | Moving shadows create streak-like patterns | Generator interprets shadow edges as anomaly streaks from training |
 | **Camera shake** | Global frame shift | All pixels displaced; MSE increases across entire frame |
-| **Weather effects** | Rain, fog, reflections | Visual appearance deviates from training distribution |
 | **Threshold too low** | τ* set aggressively | Normal variations exceed threshold |
 
-**Example:**
-```
-Frame: Normal crowd, sudden cloud shadow passes
-Effect: Global brightness drop of 30%
+**Training data pixel distributions:**
 
-Generator was trained on bright scenes only
-Reconstruction: Generator outputs bright scene
-MSE: (dark_frame - bright_reconstruction)² = HIGH
+```python
+# Normal class generation (from prepare_cpu_dataset):
+frame = np.random.randint(80, 160, (64, 64, 3))        # Background: mid-range
+frame[:, col:col+2, :] = np.random.randint(100, 140)   # Vertical structures
+frame[row:row+2, :, :] = np.random.randint(90, 130)    # Horizontal structures
 
-Score: 0.12 > τ* = 0.07 → ANOMALY (FALSE ALARM)
+# Anomaly class generation:
+frame = np.zeros((64, 64, 3))                           # Background: pure black [0,0,0]
+streak_color = [np.random.randint(200, 255),            # Streaks: bright red
+                np.random.randint(50, 100),             # with muted green/blue
+                np.random.randint(50, 100)]
+noise_color = [np.random.randint(220, 255),             # Noise: bright pixels
+               np.random.randint(80, 120),
+               np.random.randint(80, 120)]
 ```
+
+Any input frame with pixel values outside these synthetic distributions may produce high reconstruction error regardless of actual content.
 
 **Why the current code is vulnerable:**
 ```python
-# The generator conditions on label only, not on lighting/environment:
+# The generator conditions on label only, not on environmental factors:
 gen_img = self.generator(z, label)
-# No mechanism to adapt to environmental variations
 # No preprocessing to normalize illumination
+# No data augmentation to handle varied lighting conditions
+# Training data has fixed color distributions per class
 ```
 
 ---
@@ -1077,74 +1073,83 @@ gen_img = self.generator(z, label)
 
 | Cause | Explanation | Why It Happens Here |
 |-------|-------------|---------------------|
-| **Score overlap** | Normal and anomaly distributions intersect | Threshold inevitably misclassifies some samples |
-| **Transitional behavior** | Crowd shifting from normal to anomalous | Scores fall in the "gray zone" |
-| **Similar visual patterns** | Some normal patterns resemble anomalies | Structured chaos vs chaotic structure |
+| **Score overlap** | Normal and anomaly distributions intersect | Single threshold inevitably misclassifies some samples |
+| **Similar visual patterns** | Some normal patterns resemble anomalies | Structured grid patterns vs chaotic streaks can have similar entropy |
 | **Generator capacity** | Limited 64×64 resolution | Fine distinctions lost in low resolution |
-
-**Example Score Distribution:**
-```
-Normal scores:    [0.018, 0.022, 0.025, 0.031, 0.038, 0.045, 0.052, 0.058, ...]
-Anomaly scores:   [0.042, 0.048, 0.055, 0.062, 0.071, 0.089, 0.112, 0.145, ...]
-                            ↑________________↑
-                              Overlap zone
-                           (0.042 - 0.058)
-
-Samples in overlap: Classified based on τ*, inherently error-prone
-```
+| **No confidence estimation** | Binary decision only | No "uncertain" classification option |
 
 **Why the current code is vulnerable:**
 ```python
-# Single threshold for all decisions:
+# Single hard threshold for all decisions:
 predictions = (scores > threshold).astype(int)
 # No confidence scoring
 # No "uncertain" classification option
 # No ensemble or multi-threshold approach
+# No probability calibration
 ```
 
 ---
 
 #### Failure Mode D: Mode Collapse During Training
 
-**Scenario:** Generator produces limited variety, making all inputs appear anomalous or all appear normal.
+**Scenario:** Generator produces limited variety, failing to represent the full range of inputs.
 
 **Detection in Current Code:**
 ```python
 def _check_wasserstein_health(self, wasserstein_d):
-    if abs(wd) < 0.01:
-        return False, "Mode collapse likely"
+    abs_wd = abs(wasserstein_d)
+    if abs_wd < 0.01:
+        return False, "Mode collapse likely"      # D cannot distinguish real from fake
+    elif abs_wd > 20.0:
+        return False, "Training unstable"         # D severely overpowering G
+    elif abs_wd > 10.0:
+        return False, "Monitor closely"           # Warning zone
+    else:
+        return True, "Training healthy"           # 0.01 ≤ |WD| ≤ 10
 ```
 
-**Effect on Anomaly Detection:**
-```
-If generator collapses to producing one type of normal scene:
-  → All normal inputs reconstruct well (low MSE)
-  → All anomaly inputs also reconstruct poorly (high MSE)
-  → Separation is good BUT...
-  → Generator cannot represent the full range of normal behavior
-  → New normal variations will be flagged as anomalies
-```
+**Effect on anomaly detection:**
+
+When mode collapse occurs:
+- Generator produces limited variety of outputs
+- Normal inputs that differ from the collapsed mode get high MSE
+- These normal variations are incorrectly flagged as anomalies
+- Anomaly inputs may also get high MSE (good) but for wrong reasons
+
+**Mitigation in code:** The metastability controller (Section 3) and early stopping protocol detect and respond to training instability that precedes mode collapse. The aggressive phase schedule (EMERGENCY → TRANSITION → NORMAL) is designed to prevent D from overpowering G early in training.
 
 ---
 
 #### Failure Mode E: Data Leakage Amplification
 
-**Specific to this implementation** (see Section 4.7):
+**Specific to this implementation** (see Section 4.7 for full analysis):
+
+The data pipeline creates bootstrap copies before the train/test split:
 
 ```
-Training set: Contains all 25 anomaly patterns
-Test set: Contains copies of those same 25 patterns
-
-Effect on failure cases:
-  • Missed anomalies: MORE likely (generator saw exact patterns)
-  • False positives: Unchanged (normal patterns not leaked)
-  • Boundary cases: MORE overlap (scores compressed due to memorization)
-  
-Score compression due to leakage:
-  Without leakage: Anomaly scores 0.10 - 0.25 (genuine reconstruction difficulty)
-  With leakage:    Anomaly scores 0.06 - 0.15 (generator has seen these before)
-                   ↑ Closer to normal scores → More boundary cases
+Step 1: Generate 25 original anomaly frames
+Step 2: Create 117 bootstrap copies (with replacement)
+Step 3: Concatenate: [originals (0-499)] + [copies (500-616)]
+Step 4: Split at index 431:
+        - Train: indices 0-430 (contains all 25 original anomalies)
+        - Test:  indices 431-616 (contains 117 copies of those same 25 patterns)
 ```
+
+**Structural consequence:**
+
+```
+Training anomalies: 25 unique patterns (A₀ through A₂₄)
+Test anomalies:     117 copies of A₀ through A₂₄
+Contamination:      Every test anomaly pattern exists in training
+                    P(pattern_in_test | pattern_in_train) = 1.0
+```
+
+**Effect on failure modes:**
+- Missed anomalies become MORE likely (generator trained on exact test patterns)
+- Score separation between normal and anomaly narrows (generator reconstructs known anomalies better than novel ones)
+- Reported metrics reflect memorization, not generalization
+
+**Fix (see Section 4.11):** Oversample only the training set AFTER splitting, never before.
 
 ---
 
@@ -1155,15 +1160,20 @@ Score compression due to leakage:
 │ Failure Mode    │ Primary Cause      │ Specific to This Code?       │
 ├─────────────────┼────────────────────┼──────────────────────────────┤
 │ Missed Anomaly  │ Global MSE pooling │ Yes (no spatial attention)   │
-│ False Positive  │ Environment change │ Yes (no illumination norm)   │
-│ Boundary Case   │ Score distribution │ Partially (worse with leak)  │
-│ Mode Collapse   │ GAN training       │ No (common to all GANs)      │
-│ Leakage Effect  │ Test in training   │ YES (bootstrap before split) │
+│ False Positive  │ Synthetic training │ Yes (fixed color ranges per  │
+│                 │ data distribution  │ class, no env. augmentation) │
+│ Boundary Case   │ Single threshold   │ Partially (worse with leak)  │
+│ Mode Collapse   │ GAN instability    │ No (common to all GANs)      │
+│ Data Leakage    │ Bootstrap before   │ YES (fixable: reorder split) │
+│                 │ train/test split   │                              │
 └─────────────────┴────────────────────┴──────────────────────────────┘
 ```
 
+---
 
-### 8.4 Gap Analysis: What's Missing for Real Deployment
+
+
+### 8.3 Gap Analysis: What's Missing for Real Deployment
 
 ```
 ┌──────────────────────────────┬────────────────────┬─────────────────────────────┐
@@ -1209,7 +1219,7 @@ Score compression due to leakage:
 
 ---
 
-### 8.5 What the System CAN Detect (Even Now)
+### 8.4 What the System CAN Detect (Even Now)
 
 Despite being synthetic and static, the approach detects pattern changes relevant to surveillance:
 
@@ -1233,190 +1243,49 @@ This section compares three architectural approaches to crowd anomaly detection:
 
 ```
 ┌─────────────────┬─────────────────────┬──────────────────────┬─────────────────────┐
-│ Aspect          │ CGAN (This Code)    │ Perceiver IO         │ CAE                 │
+│ Aspect          │ CGAN                │ Standard CAE         │ Perceiver IO        │
+│                 │                     │ (Anomaly Detection)  │ (Referenced Paper)  │
 ├─────────────────┼─────────────────────┼──────────────────────┼─────────────────────┤
-│ Input           │ Single 64×64 frame  │ 16-frame clips       │ Single frame        │
-│                 │ + label condition   │ (T×224×224×3)        │ (variable size)     │
+│ Input           │ Single 64×64 frame  │ Single frame         │ 16-frame clip       │
+│                 │ + binary label (0/1)│ (variable resolution)│ (T×224×224×3)       │
 ├─────────────────┼─────────────────────┼──────────────────────┼─────────────────────┤
-│ Temporal        │ NONE                │ YES (self-attention  │ NONE                │
-│ Processing      │ (static images)     │  over 16 frames)     │ (static images)     │
+│ Temporal        │ NONE                │ NONE                 │ Self-attention      │
+│ Processing      │ No frame history    │ No frame history     │ over 16 frames      │
 ├─────────────────┼─────────────────────┼──────────────────────┼─────────────────────┤
-│ Spatial         │ CNN (Conv2d layers) │ Cross-attention      │ CNN (Conv2d layers) │
-│ Processing      │ Local receptive     │ Global relationships │ Local receptive     │
-│                 │ fields              │ across all positions │ fields              │
+│ Spatial         │ Conv2d layers       │ Conv2d layers        │ Cross-attention     │
+│ Processing      │ Local receptive     │ Local receptive      │ Global spatial      │
+│                 │ fields (3×3, 4×4)   │ fields               │ relationships       │
 ├─────────────────┼─────────────────────┼──────────────────────┼─────────────────────┤
-│ Complexity      │ O(N) linear         │ O(N) linear          │ O(N) linear         │
-│                 │ (small 64×64 input) │ (via latent bottleneck)│ (encoder-decoder) │
+│ Attention       │ NONE                │ NONE                 │ Cross-attention     │
+│ Mechanism       │                     │                      │ + Self-attention    │
 ├─────────────────┼─────────────────────┼──────────────────────┼─────────────────────┤
-│ Attention       │ NONE                │ Cross + Self         │ NONE                │
-│ Mechanism       │                     │ attention            │                     │
+│ Bottleneck      │ No explicit         │ Encoder compresses   │ 512-dim latent      │
+│                 │ bottleneck          │ to latent vector     │ array (fixed size)  │
 ├─────────────────┼─────────────────────┼──────────────────────┼─────────────────────┤
-│ Bottleneck      │ No explicit         │ 512-dim latent array │ Encoder latent space│
-│                 │ bottleneck          │ (fixed size)         │ (variable size)     │
+│ Generation      │ From random noise   │ From encoded input   │ N/A (classifier)    │
+│                 │ z ~ N(0,I) + label  │ (deterministic)      │                     │
 ├─────────────────┼─────────────────────┼──────────────────────┼─────────────────────┤
-│ Conditioning    │ Binary label (0/1)  │ None (unsupervised   │ None (unsupervised  │
-│                 │                     │  pretraining)        │  pretraining)       │
+│ Training        │ Adversarial         │ Self-supervised      │ Supervised          │
+│ Objective       │ WGAN-GP with GP     │ MSE reconstruction   │ Binary Cross-Entropy│
 ├─────────────────┼─────────────────────┼──────────────────────┼─────────────────────┤
-│ Anomaly Score   │ Reconstruction MSE  │ Binary classifier    │ Reconstruction MSE  │
-│                 │ (pixel-level)       │ output (softmax)     │ (pixel-level)       │
+│ Label Need      │ Yes (0=normal,      │ No                   │ Yes                 │
+│                 │  1=anomaly)         │ (trained on normal   │ (normal vs anomaly) │
+│                 │                     │  frames only)        │                     │
 ├─────────────────┼─────────────────────┼──────────────────────┼─────────────────────┤
-│ Training Data   │ Synthetic (500)     │ UMN Dataset frames   │ UMN Dataset frames  │
-│                 │                     │ (1000 frames)        │                     │
+│ Anomaly Score   │ MSE(x, G(z, y))     │ MSE(x, Dec(Enc(x)))  │ Softmax classifier  │
+│                 │ Pixel-level error   │ Pixel-level error    │ output probability  │
+├─────────────────┼─────────────────────┼──────────────────────┼─────────────────────┤
+│ Score Samples   │ K=3 (averaged)      │ 1 (deterministic)    │ 1 (deterministic)   │
+├─────────────────┼─────────────────────┼──────────────────────┼─────────────────────┤
+│ Training Data   │ Synthetic streaks   │ UMN Crowd Dataset    │ UMN Crowd Dataset   │
+│ (as implemented)│ vs grid patterns    │                      │ (1000 frames)       │
+│                 │ (500 frames)        │                      │                     │
+├─────────────────┼─────────────────────┼──────────────────────┼─────────────────────┤
+│ Image Size      │ 64×64 (fixed)       │ Variable (commonly   │ 224×224 (fixed)     │
+│                 │                     │  227×227 or 256×256) │                     │
+├─────────────────┼─────────────────────┼──────────────────────┼─────────────────────┤
+│ Stability       │ Metastability       │ Naturally stable     │ Stable (no          │
+│                 │ controller needed   │ (no adversary)       │ adversarial comp.)  │
 └─────────────────┴─────────────────────┴──────────────────────┴─────────────────────┘
+*K same as n_samples
 ```
-
-### 9.3 Spatial Modeling: CAE Complements CGAN
-
-#### What CAE Does Better
-
-**Convolutional Autoencoders** learn compact spatial representations through encoder-decoder reconstruction:
-
-```
-CAE Architecture:
-  Input (H×W×C) → Encoder (Conv+Pool) → Latent Vector (z) → Decoder (Conv+Upsample) → Reconstruction
-```
-
-| CAE Strength | Why CGAN Needs It |
-|-------------|-------------------|
-| **Deterministic encoding** | CGAN uses random z sampling; CAE provides a deterministic mapping from image→latent→image |
-| **Stable latent space** | CAE latent vectors are structured; CGAN latent space is random noise |
-| **No adversarial training** | CAE avoids D/G instability; useful as pretraining or complementary score |
-| **Explicit bottleneck** | CAE forces compression; CGAN generator can ignore latent if D is weak |
-
-#### How CAE Would Complement This CGAN
-
-```python
-# Current CGAN scoring (only):
-s_cgan(x) = MSE(x, G(z, y))          # Random z, 3 attempts
-
-# Enhanced with CAE:
-s_cae(x) = MSE(x, CAE.decode(CAE.encode(x)))  # Deterministic
-
-# Combined score:
-s_combined(x) = λ₁ · s_cgan(x) + λ₂ · s_cae(x)
-# CGAN: Learns "what should this class look like?"
-# CAE:  Learns "what is the essential structure of this image?"
-```
-
-**Complementary benefits:**
-- CGAN excels at **generative diversity** (knows what normal/anomaly should look like)
-- CAE excels at **compact representation** (knows what information matters)
-- Combined: CGAN catches class-specific deviations, CAE catches structural anomalies
-
-### 9.4 Temporal Modeling: Perceiver IO Complements CGAN
-
-#### What Perceiver IO Does Better
-
-Perceiver IO processes **sequences of frames** using attention mechanisms:
-
-```
-Perceiver IO Architecture:
-  Input (T×H×W×C) → Cross-Attention Encoder → Latent Array (512-dim)
-                                          ↓
-                                  Self-Attention Processor (iterative)
-                                          ↓
-                                  Decoder → Binary Classification
-```
-
-| Perceiver IO Strength | Why CGAN Needs It |
-|----------------------|-------------------|
-| **Temporal context** | CGAN processes single frames; Perceiver IO sees 16-frame motion patterns |
-| **Global attention** | CGAN uses local convolutions; Perceiver IO relates any position to any other |
-| **Linear complexity** | O(N) via latent bottleneck; enables high-resolution processing |
-| **Motion understanding** | Self-attention over time captures velocity, acceleration, trajectory |
-
-#### How Perceiver IO Would Complement This CGAN
-
-```python
-# Current CGAN: single frame
-s_cgan(x_t) = MSE(x_t, G(z, y))     # No temporal awareness
-
-# Perceiver IO: 16-frame clip
-s_perceiver(x_{t-15:t}) = PerceiverIO.classify(x_{t-15}, ..., x_t)  # Motion-aware
-
-# Complementary signals:
-# CGAN:     "Does this frame look anomalous in texture?"
-# Perceiver: "Is this motion pattern anomalous?"
-```
-
-**Complementary benefits:**
-- CGAN detects **spatial/texture anomalies** (unusual patterns, chaos, streaks)
-- Perceiver IO detects **temporal/motion anomalies** (sudden acceleration, direction change)
-- Combined: Spatial anomaly + normal motion = false alarm reduction; Normal appearance + anomalous motion = catch what CGAN misses
-
-### 9.5 How Perceiver IO and CAE Complement Each Other
-
-Even without CGAN, these two complement each other:
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    IDEAL HYBRID SYSTEM                      │
-│                                                             │
-│  Video Stream (T frames)                                    │
-│       │                                                     │
-│       ├──→ CAE (per frame) ──→ Spatial anomaly score s_s    │
-│       │    "Does this frame look weird?"                    │
-│       │                                                     │
-│       └──→ Perceiver IO (16 frames) ──→ Temporal score s_t  │
-│            "Is this motion pattern unusual?"                │
-│                                                             │
-│  Combined: s_total = α·s_s + β·s_t                          │
-│                                                             │
-│  Alert if s_total > τ                                       │
-└─────────────────────────────────────────────────────────────┘
-```
-
-| Scenario | CAE Score | Perceiver IO Score | Combined | Result |
-|----------|-----------|-------------------|----------|--------|
-| Normal crowd walking | Low | Low | Low | ✅ No alert |
-| Person running (clear anomaly) | High | High | High | ✅ Alert |
-| Lighting change (false positive for CAE) | High | Low | Medium | ✅ No false alert |
-| Slow suspicious behavior | Low | High | Medium | ✅ Catches what CAE misses |
-| Dense crowd (normal but looks chaotic) | High | Low | Medium | ✅ Reduced false positive |
-
-### 9.6 Three-Way Comparison Summary
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│                     METHOD COMPARISON TABLE                          │
-├────────────┬───────────────┬───────────────┬─────────────────────────┤
-│ Capability │ CGAN          │ CAE           │ Perceiver IO            │
-│            │ (This Code)   │               │                         │
-├────────────┼───────────────┼───────────────┼─────────────────────────┤
-│ Spatial    │ ✅ Generative │ ✅ Deterministic│ ✅ Global attention    │
-│ Modeling   │ (knows "look")│ (knows structure)│ (relates all positions)│
-├────────────┼───────────────┼───────────────┼─────────────────────────┤
-│ Temporal   │ ❌ None       │ ❌ None       │ ✅ 16-frame attention   │
-│ Modeling   │               │               │ (motion patterns)       │
-├────────────┼───────────────┼───────────────┼─────────────────────────┤
-│ Attention  │ ❌ None       │ ❌ None       │ ✅ Cross + Self         │
-│ Mechanism  │               │               │                         │
-├────────────┼───────────────┼───────────────┼─────────────────────────┤
-│ Complexity │ O(N)          │ O(N)          │ O(N) via latent array   │
-├────────────┼───────────────┼───────────────┼─────────────────────────┤
-│ Training   │ Adversarial   │ Reconstruction│ Supervised              │
-│ Objective  │ (WGAN-GP)     │ (MSE)         │ (Binary Cross-Entropy)  │
-├────────────┼───────────────┼───────────────┼─────────────────────────┤
-│ Bottleneck │ None explicit │ Encoder latent │ 512-dim latent array    │
-├────────────┼───────────────┼───────────────┼─────────────────────────┤
-│ Real-time  │ ⚠️ CPU-opt    │ ✅ Fast       │ ✅ Linear scaling       │
-│ Ready      │ (not tested)  │ inference     │ (predictable latency)   │
-├────────────┼───────────────┼───────────────┼─────────────────────────┤
-│ Data       │ Synthetic     │ UMN Dataset   │ UMN Dataset             │
-│            │ (500 images)  │               │ (1000 frames)           │
-├────────────┼───────────────┼───────────────┼─────────────────────────┤
-│ Anomaly    │ Reconstruction│ Reconstruction│ Binary Classification    │
-│ Detection  │ MSE           │ MSE           │ (Softmax output)        │
-├────────────┼───────────────┼───────────────┼─────────────────────────┤
-│ Strengths  │ Class-        │ Stable        │ Temporal awareness      │
-│            │ conditional   │ training      │ Global context          │
-│            │ generation    │ Compact rep   │ Multi-modal ready       │
-├────────────┼───────────────┼───────────────┼─────────────────────────┤
-│ Weaknesses │ No temporal   │ No temporal   │ Requires sequence data  │
-│            │ No attention  │ No attention  │ Higher data requirements│
-│            │ Adversarial   │ No generative │ Supervised labels       │
-│            │ instability   │ capability    │ needed                  │
-└────────────┴───────────────┴───────────────┴─────────────────────────┘
-```
-
-
